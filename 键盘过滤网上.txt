@@ -1,0 +1,273 @@
+#include <ntddk.h>
+#include <ntddkbd.h>
+
+#define KBD_DRIVER_NAME L"\\Driver\\kbdclass"
+
+typedef struct _DEVICE_EXTENSION
+{
+	PIRP proxyIrp;
+	PDEVICE_OBJECT poldDevice;
+	PDEVICE_OBJECT pDevice;
+	PDEVICE_OBJECT pbindDevice;
+}DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+
+extern POBJECT_TYPE* IoDriverObjectType;
+
+NTSTATUS ObReferenceObjectByName(
+	PUNICODE_STRING ObjectName,
+	ULONG Attributes,
+	PACCESS_STATE AccessState,
+	ACCESS_MASK DesiredAccess,
+	POBJECT_TYPE ObjectType,
+	KPROCESSOR_MODE AccessMode,
+	PVOID ParseContest,
+	PVOID* Object
+);
+
+NTSTATUS FilterDispatchRoutin(IN PDEVICE_OBJECT pDevObj, IN PIRP pIrp);
+
+BOOLEAN CancelIrp(PIRP pIrp);
+void FilterUnload(IN PDRIVER_OBJECT pDriverObject);
+NTSTATUS BindDevice(PDRIVER_OBJECT pDriverObject);
+NTSTATUS CreateDevice(IN PDRIVER_OBJECT pDriverObject, IN PDEVICE_OBJECT oldDevObj);
+NTSTATUS CallBackKbdFilter(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp, IN PVOID Context);
+
+//驱动入口
+NTSTATUS DriverEntry(IN PDRIVER_OBJECT pDriverObject, IN PUNICODE_STRING pRegistryPath)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	DbgPrint("driver::registerPath ... %ws ...\n", pRegistryPath->Buffer);
+	DbgPrint("driver::驱动加载开始.../n");
+	pDriverObject->DriverUnload = FilterUnload;
+
+	//设置读取派遣函数
+	pDriverObject->MajorFunction[IRP_MJ_READ] = FilterDispatchRoutin;
+
+	BindDevice(pDriverObject);
+
+	DbgPrint("driver::驱动加载结束.../n");
+
+	return status;
+}
+
+BOOLEAN CancelIrp(PIRP pIrp)
+{
+	if (pIrp == NULL)
+	{
+		DbgPrint("取消irp错误.../n");
+		return FALSE;
+	}
+	if (pIrp->Cancel || pIrp->CancelRoutine == NULL)
+	{
+		DbgPrint("取消irp错误.../n");
+		return FALSE;
+	}
+	if (FALSE == IoCancelIrp(pIrp))
+	{
+		DbgPrint("IoCancelIrp to irp错误.../n");
+		return FALSE;
+	}
+
+	//取消后重设此例为空
+	IoSetCancelRoutine(pIrp, NULL);
+	return TRUE;
+}
+
+NTSTATUS CallBackKbdFilter(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp, IN PVOID Context)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(Context);
+	PIO_STACK_LOCATION currentIrp;
+	PKEYBOARD_INPUT_DATA keyData;
+
+	currentIrp = IoGetCurrentIrpStackLocation(Irp);
+
+	if (NT_SUCCESS(Irp->IoStatus.Status))
+	{
+		keyData = (PKEYBOARD_INPUT_DATA)Irp->AssociatedIrp.SystemBuffer;
+
+		//DbgPrint("扫描码：%x",keyData->MakeCode);
+		DbgPrint("键盘 ：%s", keyData->Flags ? "UP" : "DOWN");
+		//print_keystroke((UCHAR)keyData->MakeCode);
+		if (keyData->MakeCode == 0x1f)
+		{
+			keyData->MakeCode = 0x20;
+		}
+	}
+	if (Irp->PendingReturned)
+	{
+		IoMarkIrpPending(Irp);
+	}
+	return Irp->IoStatus.Status;
+}
+
+
+//派遣函数
+NTSTATUS FilterDispatchRoutin(IN PDEVICE_OBJECT pDevObj, IN PIRP pIrp)
+{
+	PIO_STACK_LOCATION currentIrpStack;
+	PDEVICE_EXTENSION pDevExt;
+
+	//得到设备扩展
+	pDevExt = pDevObj->DeviceExtension;
+
+	//得到当前irp包
+	currentIrpStack = IoGetCurrentIrpStackLocation(pIrp);
+	//将当前irp复制到下层设备irp堆栈
+	IoCopyCurrentIrpStackLocationToNext(pIrp);
+
+	//保存原来的irp
+	//pDevExt->tagIrp=pIrp;
+
+	//代理irp
+	pDevExt->proxyIrp = pIrp;
+
+	//设置当irp完成时的回调例程
+	IoSetCompletionRoutine(pDevExt->proxyIrp, CallBackKbdFilter, pDevObj, TRUE, TRUE, TRUE);
+	DbgPrint("driver::irp回调例程设置完毕.../n");
+	return IoCallDriver(pDevExt->poldDevice, pDevExt->proxyIrp);
+}
+
+//创建设备
+NTSTATUS CreateDevice(IN PDRIVER_OBJECT pDriverObject, IN PDEVICE_OBJECT oldDevObj)
+{
+	NTSTATUS status;
+	PDEVICE_OBJECT pDevObj;
+	//谁被扩展
+	PDEVICE_EXTENSION pDevExt;
+
+	status = IoCreateDevice(pDriverObject,
+		sizeof(PDEVICE_EXTENSION),
+		NULL,
+		oldDevObj->DeviceType,//设备类型需要和被附加的设备类型相等
+		0,
+		FALSE,//如果指定设备是独占的,大部分驱动程序设置这个值为FALSE,如果不是独占的话设置为TRUE.
+		&pDevObj);
+
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrint("driver::创建设备失败..../n");
+		return status;
+	}
+	pDevExt = pDevObj->DeviceExtension;
+	//存储设备对象
+	pDevExt->pDevice = pDevObj;
+	//绑定前原设备
+	pDevExt->poldDevice = oldDevObj;
+
+	//标志位
+	pDevObj->Flags |= oldDevObj->Flags & (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
+
+	//该标识指示I/O管理器对所有发送到控制设备对象的Open请求进行安全检测
+	pDevObj->Characteristics = oldDevObj->Characteristics;
+
+
+	//绑定设备
+	PDEVICE_OBJECT topDev = IoAttachDeviceToDeviceStack(pDevObj, oldDevObj);
+	if (topDev == NULL)
+	{
+		//如果绑定失败,销毁设备
+		IoDeleteDevice(pDevObj);
+		status = STATUS_UNSUCCESSFUL;
+		return status;
+	}
+
+	//将绑定的设备和原始设备放入设备扩展中
+	pDevExt->poldDevice = oldDevObj;
+	pDevExt->pbindDevice = topDev;
+
+	pDevObj->Flags = pDevObj->Flags & ~DO_DEVICE_INITIALIZING;
+	KdPrint(("driver::绑定成功../n"));
+	return STATUS_SUCCESS;
+}
+
+//绑定设备
+NTSTATUS BindDevice(PDRIVER_OBJECT pDriverObject)
+{
+	NTSTATUS status;
+	UNICODE_STRING uniNtNameString;
+
+	//要打开的驱动对象
+	PDRIVER_OBJECT KbdDriverObject = NULL;
+	//驱动对象的设备
+	PDEVICE_OBJECT kbdDeviceOjbect;
+
+	//初始化一个字符串，就是kbdclass驱动的名子
+	RtlInitUnicodeString(&uniNtNameString, KBD_DRIVER_NAME);
+
+	//根据名字打开驱动对象
+	status = ObReferenceObjectByName(
+		&uniNtNameString,
+		OBJ_CASE_INSENSITIVE,
+		NULL,
+		0,
+		*IoDriverObjectType,
+		KernelMode,
+		NULL,
+		(PVOID*)&KbdDriverObject);
+
+	//如果失败了就直接返回
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrint("driver::打开设备失败.../n");
+		return status;
+	}
+
+	//调用ObReferenceObjectByName会导致对驱动对象的引用计数增加
+	//必须响应的调用解引用ObDereferenceObject
+	ObDereferenceObject(pDriverObject);
+	DbgPrint("driver::打开成功，解除引用.../n");
+
+
+	//键盘驱动的第一个设备
+	kbdDeviceOjbect = KbdDriverObject->DeviceObject;
+	while (kbdDeviceOjbect != NULL)
+	{
+		//创建并绑定过滤设备
+		CreateDevice(pDriverObject, kbdDeviceOjbect);
+		//下一个设备
+		kbdDeviceOjbect = kbdDeviceOjbect->NextDevice;
+	}
+
+	return status;
+}
+
+//卸载例程
+void FilterUnload(IN PDRIVER_OBJECT pDriverObject)
+{
+	//得到设备
+	PDEVICE_OBJECT pDevObj = pDriverObject->DeviceObject;
+	while (pDevObj != NULL)
+	{
+		//设备扩展
+		PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)pDevObj->DeviceExtension;
+		//PDEVICE_OBJECT pTagObj = pDevExt->pbindDevice;
+
+		//解除绑定
+		if (pDevExt->pbindDevice != NULL)
+		{
+			IoDetachDevice(pDevExt->pbindDevice);
+		}
+
+		//删除设备
+		if (pDevExt->pDevice != NULL)
+		{
+			IoDeleteDevice(pDevExt->pDevice);
+		}
+
+		if (pDevExt->proxyIrp != NULL)
+		{
+			if (CancelIrp(pDevExt->proxyIrp))
+			{
+				DbgPrint("取消成功。。。/n");
+			}
+			else
+			{
+				DbgPrint("取消失败。。。/n");
+			}
+		}
+		//下一个设备
+		pDevObj = pDevObj->NextDevice;
+
+	}
+}
